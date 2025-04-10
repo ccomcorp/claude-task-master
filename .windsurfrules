@@ -1,0 +1,113 @@
+# Product Requirements Document  
+# Task Master State Management Conversion
+
+Prime Directive: Always use the TM folder as the root folder to place all the project files
+
+## 1. Overview
+
+Task Master’s current implementation manages tasks by directly reading from and writing to a JSON file (`tasks.json`) for every operation. Core modules like `task-manager.js` handle task CRUD by accessing this file system state, and CLI commands (defined in `commands.js`) invoke those file-based functions. Even user interface helpers in `ui.js` read the tasks file on the fly to display information. This file-centric approach simplifies persistence but scatters state logic across the codebase, making it harder to maintain, test, and extend.
+
+This document outlines the requirements to refactor Task Master’s state handling into a **centralized state management architecture**. The goal is to introduce a single source of truth in memory for all task data (mirroring the contents of `tasks.json`), with formal APIs for state access and mutation. We will migrate the CLI tool to use this state store instead of performing raw file I/O in each command. The existing CLI usage and task file format will remain **backward compatible** – users will notice no changes in commands or outputs. By isolating state management, we aim to improve reliability (fewer file race conditions or corruption risks), make the code more modular and testable, and lay groundwork for future enhancements.
+
+## 2. Goals
+
+- **Centralize Task State** – Implement a robust in-memory state store for all tasks, replacing ad-hoc file reads/writes. All modules will source and update task data through this single state object.
+- **Maintain Backward Compatibility** – Preserve the existing CLI interface (command names, options, and behavior) and the `tasks.json` file format. Users’ current commands (e.g. `task-master list`, `add-task`, etc.) and workflows will continue to work exactly as before. For example, the `-f/--file` option to specify an alternate tasks file will still be supported.
+- **Improve Maintainability & Testability** – Refactor code to separate state logic from presentation and I/O. This modular design will make it easier to unit test state transitions in isolation (no need to stub the file system on every test) and to reason about the app’s behavior.
+- **Enhance Reliability of State Transitions** – Introduce structured state transition management (e.g. a state machine for task statuses) to prevent invalid state changes and ensure data integrity. By controlling how tasks move between statuses (pending, in-progress, done, etc.), the system can avoid logical errors.
+- **State Persistence and Recovery** – Continue to persist all task data to disk (still using `tasks.json` under the hood) but in a controlled manner. Implement safeguards like debounced writes and file locking to avoid race conditions or corruption, and consider automatic backups for recovery.
+- **Foundation for Future Features** – Although no new CLI features are added in this refactor, the new architecture will be designed to be extensible so that additional features (undo/redo, real-time collaboration, etc.) can be added without major changes.
+
+## 3. Scope
+
+**In-Scope:** The project focuses exclusively on the internal re-architecture of state management without altering external behavior. It includes: 
+
+- **State Store Module:** Creating a centralized state store (e.g. `state-store.js`) for holding all task data in memory and exposing methods for state access and mutation.
+- **Action Creators:** Implementing a set of functions in a new module (e.g. `actions.js`) that encapsulate all allowed state mutations (adding tasks, updating status, etc.) instead of scattered file operations.
+- **CLI Refactoring:** Updating all CLI commands to use the centralized state store via the new actions rather than performing file I/O. The external interface remains identical.
+- **State Observers & Persistence:** Implementing observers that react to state changes in order to persist state to disk (writing to `tasks.json`) and enforce consistency.
+- **Task State Machine:** Defining a formal state machine for task statuses and transitions to enforce valid moves (e.g. pending → in-progress → done) and prevent invalid state transitions.
+- **Testing:** Writing unit tests for the state store, actions, and state machine, as well as integration tests for CLI commands to ensure full backward compatibility.
+- **Documentation Updates:** Revising internal documentation (developer docs, README updates) to reflect the new state management approach while leaving user-facing behavior unchanged.
+
+**Out of Scope:** No new user features are added. The current command-line interface, file formats, and workflows remain unchanged. Only internal refactoring is performed.
+
+## 4. Detailed Implementation Strategy
+
+### 4.1. Phase 1: Create State Management Infrastructure
+
+#### 4.1.1. State Store Implementation
+
+Create a centralized state store (e.g. in `state-store.js`) that:
+
+- Uses Node’s `EventEmitter` to allow registration of change listeners.
+- Maintains state as a single object (including `tasks`, `meta`, `currentTask`, `loading`, `error`, and `lastUpdated`).
+- Provides getter methods (`getState()`, `getTaskById()`, etc.) and a controlled `setState(partialState, options)` method that updates state, updates `lastUpdated`, optionally records history (for potential undo/redo), and emits change events.
+- Handles file persistence via `loadState(filePath?)` and `saveState(filePath?)`, including debouncing writes and using file locks as needed.
+- Supports dynamic file paths if specified via CLI options.
+
+#### 4.1.2. Action Creators
+
+Implement a new module (e.g. `actions.js`) that defines all state mutations via functions such as:
+
+- `loadTasks(filePath)`, `addTask(taskData)`, `updateTask(id, taskData)`, `removeTask(id)`, and `setTaskStatus(id, status)` – each reading from and writing to the in-memory state.
+- `addSubtask(parentId, subtaskData)`, `updateSubtask(parentId, subtaskId, subtaskData)`, and `removeSubtask(parentId, subtaskId)`.
+- `addDependency(taskId, dependsOnId)` and `removeDependency(taskId, dependsOnId)`.
+- AI-related actions like `parsePRD(filePath, numTasks)` and `expandTask(taskId, numSubtasks, useResearch, context)` that update state with data generated by AI while preserving existing behavior.
+- Validation within each action (using helper functions or schema checks) and error handling (throwing errors for invalid operations).
+
+Each action should:
+- Use asynchronous functions (async/await).
+- Call `taskStore.setState()` to update and persist state.
+- Return useful values (such as the new task) for the CLI layer.
+
+#### 4.1.3. State Observers
+
+Implement observers (e.g. in an `observers.js` module) that:
+
+- Listen for state changes and trigger automatic persistence (saving the current state to `tasks.json`).
+- Optionally log state changes and run consistency checks (e.g. dependency validation).
+- Are registered at application startup to ensure that every change is reflected on disk and that business rules (auto-updating of task statuses, etc.) are enforced.
+
+#### 4.1.4. Task State Machine
+
+Create a module (e.g. `task-state-machine.js`) that:
+
+- Defines valid statuses (e.g. `pending`, `in-progress`, `done`, `deferred`) and allowed transitions.
+- Exposes functions such as `canTransition(from, to)` and `transition(task, newStatus)` to validate and perform transitions.
+- Is integrated into actions (e.g. `setTaskStatus`) to prevent invalid status changes.
+- Optionally supports hooks for pre- and post-transition actions.
+
+### 4.2. Phase 2: Refactor CLI Commands
+
+Update the CLI command infrastructure so that:
+
+- On startup, the CLI loads tasks from the specified file (defaulting to `tasks/tasks.json`) via the state store.
+- Each CLI command (list, show, add-task, set-status, add-subtask, etc.) retrieves or updates state exclusively through the new action creators.
+- The overall output and user experience remain unchanged (same formatting, help text, and command names).
+- File-related options (like `--file`) continue to work by redirecting the state store to load and save from the designated path.
+- UI helper functions (in `ui.js`) are updated to format data passed from the state rather than doing file I/O themselves.
+
+### 4.3. Phase 3: Testing Strategy
+
+Develop a comprehensive testing suite that includes:
+
+- **Unit Tests:** For the state store (testing `getState`, `setState`, event emission), action creators (ensuring correct state modifications and error handling), and the state machine (validating allowed transitions and rejecting invalid ones).
+- **Integration Tests:** For CLI commands executed end-to-end (spawning the CLI process, checking output, and verifying that the underlying `tasks.json` file is updated correctly). Use controlled test fixtures and temporary file paths to avoid impacting production data.
+- **Backward Compatibility Checks:** Ensure that existing command outputs (e.g. `list`, `show`) match expected formats, and that generated task files remain unchanged.
+- **Error Handling:** Test cases where invalid input is provided and verify that meaningful error messages are displayed without breaking the process.
+
+### 4.4. Phase 4: Documentation and Release
+
+- **Update Developer Documentation:** Include a new section (or update the existing architecture document) explaining the centralized state management system, listing the new modules (`state-store.js`, `actions.js`, `task-state-machine.js`, `observers.js`), and detailing how to add new features using the state store.
+- **Update the README:** Ensure that any instructions for command-line usage remain unchanged, but note internally that state is now managed centrally.
+- **Verify Backward Compatibility:** Before merging, perform both automated and manual testing with existing workflows.
+- **Release Plan:** Once testing is complete, merge the changes and notify users (via changeset or release notes) that Task Master now uses a centralized state management system with improved reliability and maintainability, with no change to the CLI interface.
+
+---
+
+This document should provide a clear guide for a senior developer to migrate Task Master’s state management from scattered file-based operations to a centralized, event-driven state store with structured actions and validations.
+
+---
+
+*References: Portions of this document reference content from the original repository’s files (such as `task-master-state-prd.md` and `repomix-output-claude-task-master.md`) as indicated by citation markers (e.g. “”).*
